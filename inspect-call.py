@@ -1,4 +1,5 @@
 from typing import Generator, Literal
+
 import idc
 import idaapi
 import ida_dbg
@@ -8,7 +9,7 @@ import ida_ua
 import ida_idp
 import ida_kernwin
 import ida_idaapi
-import time
+import idautils
 
 ACTION_TRACE_FUNC = "dtrace:trace_func"
 ACTION_TRACE_INSTR = "dtrace:trace_instr"
@@ -136,6 +137,7 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
         func_name, func_start_ea, func_end_ea = self.get_func_info(func)
 
         while True:
+            ida_kernwin.refresh_()
             if ida_kernwin.user_cancelled():
                 print("DynamicTracer: Trace cancelled by user.")
                 raise StopIteration
@@ -151,9 +153,44 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
                 print(f"DynamicTracer: Found return instruction at 0x{current_ip:x}. Tracing finished.")
                 raise StopIteration
 
-            yield current_ip
-            ida_dbg.step_over()
-            ida_dbg.wait_for_next_event(idc.WFNE_SUSP, -1)
+            is_indirect_call = self.is_addr_call(current_ip)
+            is_jmp = self.is_jump_insn(current_ip)
+
+            if is_jmp or is_indirect_call:
+                yield current_ip
+                ida_dbg.step_over()
+                ida_dbg.wait_for_next_event(idc.WFNE_SUSP, -1)
+            else:
+                next_target = self.find_next_interesting_instruction(current_ip, func_end_ea)
+                if next_target != idc.BADADDR:
+                    bpt = idaapi.bpt_t()
+                    user_bpt_exists = ida_dbg.get_bpt(next_target, bpt)
+                    original_bpt_props = None
+
+                    if user_bpt_exists:
+                        print(f"DynamicTracer: Found user BP at 0x{next_target:x}. Temporarily making it unconditional.")
+                        original_bpt_props = {"condition": bpt.condition, "flags": bpt.flags, "pass_count": bpt.pass_count}
+                        bpt.condition = ""
+                        bpt.pass_count = 0
+                        bpt.flags &= ~idc.BPT_BRK
+                        ida_dbg.update_bpt(bpt)
+                    else:
+                        ida_dbg.add_bpt(next_target, 0, idc.BPT_SOFT)
+
+                    ida_dbg.continue_process()
+                    ida_dbg.wait_for_next_event(idc.WFNE_SUSP, -1)
+
+                    if user_bpt_exists and original_bpt_props is not None:
+                        print(f"DynamicTracer: Restoring user BP at 0x{next_target:x}.")
+                        bpt.condition = original_bpt_props["condition"]
+                        bpt.flags = original_bpt_props["flags"]
+                        bpt.pass_count = original_bpt_props["pass_count"]
+                        ida_dbg.update_bpt(bpt)
+                    else:
+                        ida_dbg.del_bpt(next_target)
+                else:
+                    ida_dbg.step_over()
+                    ida_dbg.wait_for_next_event(idc.WFNE_SUSP, -1)
 
     def is_addr_call(self, current_ip: str) -> bool:
         if not ida_idp.is_call_insn(current_ip):
@@ -264,6 +301,29 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
             print("--- DynamicTracer: Full Function Trace Finished ---")
             ida_kernwin.hide_wait_box()
             self.is_tracing_active = False
+
+    def is_jump_insn(self, ea: int) -> bool:
+        if ida_idp.is_call_insn(ea):
+            return False
+
+        for xref in idautils.XrefsFrom(ea, 0):
+            if xref.type in [idc.fl_JN, idc.fl_JF]:
+                return True
+
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) > 0:
+            if insn.get_canon_feature() & ida_idp.CF_JUMP:
+                return True
+
+        return False
+
+    def find_next_interesting_instruction(self, start_ea: int, end_ea: int) -> int:
+        ea = idc.next_head(start_ea, end_ea)
+        while ea != idc.BADADDR and ea < end_ea:
+            if self.is_jump_insn(ea) or self.is_addr_call(ea):
+                return ea
+            ea = idc.next_head(ea, end_ea)
+        return idc.BADADDR
 
 
 def PLUGIN_ENTRY() -> DynamicTracerPlugin:
