@@ -1,5 +1,4 @@
 from typing import Generator, Literal
-
 import idc
 import idaapi
 import ida_dbg
@@ -8,7 +7,6 @@ import ida_funcs
 import ida_ua
 import ida_idp
 import ida_kernwin
-import ida_idaapi
 import idautils
 
 ACTION_TRACE_FUNC = "dtrace:trace_func"
@@ -16,6 +14,26 @@ ACTION_TRACE_INSTR = "dtrace:trace_instr"
 TOOLBAR_NAME = "Dynamic Analysis"
 
 g_dynamic_tracer_plugin = None
+
+
+class DbgHook(ida_dbg.DBG_Hooks):
+    def update_ui(self):
+        ida_kernwin.execute_sync(
+            lambda: ida_kernwin.request_refresh(ida_kernwin.IWID_ALL),
+            ida_kernwin.MFF_WRITE)
+
+    def dbg_suspend_process(self, *args):
+        self.update_ui()
+        return 0
+
+    def dbg_continue_process(self, *args):
+        self.update_ui()
+        return 0
+
+    def dbg_process_exited(self, *args):
+        """Called when the process exits."""
+        self.update_ui()
+        return 0
 
 
 class ActionTraceFunctionHandler(idaapi.action_handler_t):
@@ -27,13 +45,10 @@ class ActionTraceFunctionHandler(idaapi.action_handler_t):
         return 1
 
     def update(self, ctx):
-
         if g_dynamic_tracer_plugin and g_dynamic_tracer_plugin.is_tracing_active:
             return idaapi.AST_DISABLE_FOR_WIDGET
-
         if ida_dbg.get_process_state() == ida_dbg.DSTATE_SUSP:
             return idaapi.AST_ENABLE_FOR_WIDGET
-
         return idaapi.AST_DISABLE_FOR_WIDGET
 
 
@@ -46,30 +61,34 @@ class ActionTraceInstructionHandler(idaapi.action_handler_t):
         return 1
 
     def update(self, ctx):
-
         if g_dynamic_tracer_plugin and g_dynamic_tracer_plugin.is_tracing_active:
             return idaapi.AST_DISABLE_FOR_WIDGET
-
         if ida_dbg.get_process_state() == ida_dbg.DSTATE_SUSP:
             return idaapi.AST_ENABLE_FOR_WIDGET
         else:
             return idaapi.AST_DISABLE_FOR_WIDGET
 
 
-class DynamicTracerPlugin(ida_idaapi.plugin_t):
-    flags = ida_idaapi.PLUGIN_KEEP
+class DynamicTracerPlugin(idaapi.plugin_t):
+    flags = idaapi.PLUGIN_KEEP
     comment = "Dynamically traces and resolves indirect calls within the debugger."
     help = "See source code for detailed instructions."
     wanted_name = "Dynamic Call Tracer"
     wanted_hotkey = ""
 
     def __init__(self):
+        super().__init__()
         self.hotkey_ctx = None
         self.is_tracing_active = False
+        self.dbg_hook = None
 
     def init(self):
         global g_dynamic_tracer_plugin
         g_dynamic_tracer_plugin = self
+
+        self.dbg_hook = DbgHook()
+        self.dbg_hook.hook()
+        print("DynamicTracer: Debugger hook installed for responsive UI updates.")
 
         self.hotkey_ctx = ida_kernwin.add_hotkey("Ctrl-Alt-R", self.trace_instruction_under_cursor)
         if self.hotkey_ctx is None:
@@ -78,28 +97,33 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
             print("DynamicTracer: Hotkey 'Ctrl-Alt-R' for on-demand call resolving is active.")
 
         actions = [
-            idaapi.action_desc_t(ACTION_TRACE_FUNC, "Trace active function", ActionTraceFunctionHandler(), None, "Trace all indirect calls in the current function", 20),  # icon: debug_step_over
-            idaapi.action_desc_t(ACTION_TRACE_INSTR, "Trace current instruction", ActionTraceInstructionHandler(), None, "Resolve indirect call under the cursor", 19)  # icon: debug_step_into
+            idaapi.action_desc_t(ACTION_TRACE_FUNC, "Trace active function", ActionTraceFunctionHandler(), None, "Trace all indirect calls in the current function", 20),
+            idaapi.action_desc_t(ACTION_TRACE_INSTR, "Trace current instruction", ActionTraceInstructionHandler(), None, "Resolve indirect call under the cursor", 19)
         ]
         for action in actions:
             if not idaapi.register_action(action):
                 print(f"DynamicTracer: Failed to register action '{action.name}'")
 
         if ida_kernwin.create_toolbar(TOOLBAR_NAME, "Dynamic Analysis"):
-            print(f"DynamicTracer: Failed to create toolbar '{TOOLBAR_NAME}'")
-        else:
             ida_kernwin.attach_action_to_toolbar(TOOLBAR_NAME, ACTION_TRACE_FUNC)
             ida_kernwin.attach_action_to_toolbar(TOOLBAR_NAME, ACTION_TRACE_INSTR)
             print(f"DynamicTracer: Successfully created '{TOOLBAR_NAME}' toolbar.")
+        else:
+            print(f"DynamicTracer: Failed to create toolbar '{TOOLBAR_NAME}'")
 
         print("Dynamic Call Tracer plugin has been loaded.\n    > MAKE SURE 'Use hardware temporary breakpoints' is disabled")
-        return ida_idaapi.PLUGIN_KEEP
+        return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
         self.trace_active_function()
 
     def term(self):
         global g_dynamic_tracer_plugin
+
+        if self.dbg_hook:
+            self.dbg_hook.unhook()
+            self.dbg_hook = None
+
         if self.hotkey_ctx:
             ida_kernwin.del_hotkey(self.hotkey_ctx)
         if ida_kernwin.delete_toolbar(TOOLBAR_NAME):
@@ -137,13 +161,11 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
         func_name, func_start_ea, func_end_ea = self.get_func_info(func)
 
         while True:
-            ida_kernwin.refresh_()
             if ida_kernwin.user_cancelled():
                 print("DynamicTracer: Trace cancelled by user.")
                 raise StopIteration
 
             current_ip = idc.get_reg_value(ip_reg_name)
-
             ida_kernwin.replace_wait_box(f"Tracing at 0x{current_ip:x}")
 
             if not (func_start_ea <= current_ip < func_end_ea):
@@ -192,7 +214,7 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
                     ida_dbg.step_over()
                     ida_dbg.wait_for_next_event(idc.WFNE_SUSP, -1)
 
-    def is_addr_call(self, current_ip: str) -> bool:
+    def is_addr_call(self, current_ip: int) -> bool:
         if not ida_idp.is_call_insn(current_ip):
             return False
         insn = ida_ua.insn_t()
@@ -231,18 +253,15 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
             raise IndexError
 
         print(f"DynamicTracer: Setting temp BP at 0x{next_ea_in_original_func:x} to resume trace.")
-
         ida_dbg.add_bpt(next_ea_in_original_func, 0, idc.BPT_SOFT)
         ida_dbg.continue_process()
         ida_dbg.wait_for_next_event(idc.WFNE_SUSP, -1)
         ida_dbg.del_bpt(next_ea_in_original_func)
 
         func_name = idc.get_func_name(final_target_ea)
-
         if not func_name:
             print(f"DynamicTracer: Resumed trace at 0x{idc.get_reg_value(ip_reg_name):x} but failed to resolve name")
             return None
-
         return func_name
 
     def trace_instruction(self, func: ida_funcs.func_t, current_ip: int) -> bool:
@@ -261,33 +280,27 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
             idc.set_cmt(current_ip, new_comment, 0)
 
         ida_kernwin.refresh_idaview_anyway()
-
         return True
 
     def trace_instruction_under_cursor(self) -> None:
         func = self.get_active_func()
         if not func:
             return
-
         ip_reg_name = self.get_reg_name()
         current_ip = idc.get_reg_value(ip_reg_name)
         if not self.is_addr_call(current_ip):
             return
-
         self.trace_instruction(func, current_ip)
 
     def trace_active_function(self) -> None:
         if self.is_tracing_active:
             print("DynamicTracer: A trace is already in progress.")
             return
-
         func = self.get_active_func()
         if func is None:
             return
-
         self.is_tracing_active = True
         ida_kernwin.show_wait_box("Tracing function... Click Cancel to stop.")
-
         try:
             print("--- DynamicTracer: Full Function Trace Started ---")
             commented_eas = set()
@@ -297,6 +310,8 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
                 if not self.trace_instruction(func, current_ip):
                     continue
                 commented_eas.add(current_ip)
+        except (IndexError, StopIteration):
+            pass  # Normal termination of the trace
         finally:
             print("--- DynamicTracer: Full Function Trace Finished ---")
             ida_kernwin.hide_wait_box()
@@ -306,13 +321,13 @@ class DynamicTracerPlugin(ida_idaapi.plugin_t):
         if ida_idp.is_call_insn(ea):
             return False
 
-        for xref in idautils.XrefsFrom(ea, 0):
-            if xref.type in [idc.fl_JN, idc.fl_JF]:
-                return True
-
         insn = ida_ua.insn_t()
         if ida_ua.decode_insn(insn, ea) > 0:
             if insn.get_canon_feature() & ida_idp.CF_JUMP:
+                return True
+
+        for xref in idautils.XrefsFrom(ea, 0):
+            if xref.type in [idc.fl_JN, idc.fl_JF]:
                 return True
 
         return False
